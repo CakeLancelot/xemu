@@ -14,6 +14,11 @@
 #ifndef QEMU_OBJECT_H
 #define QEMU_OBJECT_H
 
+#ifdef __cplusplus
+#define class qom_class
+#define typename qom_typename
+#endif
+
 #include "qapi/qapi-builtin-types.h"
 #include "qemu/module.h"
 
@@ -1747,4 +1752,11 @@ Object *container_get(Object *root, const char *path);
  * Returns the instance_size of the given @typename.
  */
 size_t object_type_get_instance_size(const char *typename);
+
+
+#ifdef __cplusplus
+#undef class
+#undef typename
+#endif
+
 #endif

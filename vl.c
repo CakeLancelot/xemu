@@ -132,6 +132,9 @@ int main(int argc, char **argv)
 #include "sysemu/iothread.h"
 #include "qemu/guest-random.h"
 
+#include "ui/xemu-settings.h"
+#include "ui/xemu-notifications.h"
+
 #define MAX_VIRTIO_CONSOLES 1
 
 static const char *data_dir[16];
@@ -147,7 +150,7 @@ bool enable_mlock = false;
 bool enable_cpu_pm = false;
 int nb_nics;
 NICInfo nd_table[MAX_NICS];
-int autostart;
+int autostart = 1;
 static enum {
     RTC_BASE_UTC,
     RTC_BASE_LOCALTIME,
@@ -2825,6 +2828,17 @@ static void user_register_global_props(void)
                       global_init_func, NULL, NULL);
 }
 
+/* Return 1 if file fails to open */
+static int xemu_check_file(const char *path)
+{
+    FILE *fd = fopen(path, "rb");
+    if (fd == NULL) {
+        return 1;
+    }
+    fclose(fd);
+    return 0;
+}
+
 int main(int argc, char **argv, char **envp)
 {
     int i;
@@ -2866,6 +2880,113 @@ int main(int argc, char **argv, char **envp)
 
     error_init(argv[0]);
     module_call_init(MODULE_INIT_TRACE);
+
+    //
+    // FIXME: This is a hack to get QEMU to load correct machine and properties
+    // very early, and handle some basic error cases without hooking QEMU error
+    // reporting. This should be replaced eventually, but is "good enough" for
+    // now.
+    //
+    xemu_settings_load();
+    char *fake_argv[32];
+    memset(fake_argv, 0, 32 * sizeof(char*));
+
+    int fake_argc = 0;
+    fake_argv[fake_argc++] = argv[0];
+    fake_argv[fake_argc++] = strdup("-cpu");
+    fake_argv[fake_argc++] = strdup("pentium3");
+    fake_argv[fake_argc++] = strdup("-machine");
+
+    const char *bootrom_path;
+    xemu_settings_get_string(XEMU_SETTINGS_SYSTEM_BOOTROM_PATH, &bootrom_path);
+    if (strlen(bootrom_path) > 0 && xemu_check_file(bootrom_path)) {
+        char *msg = g_strdup_printf("Failed to open BootROM file '%s'. Please check machine settings.", bootrom_path);
+        xemu_queue_error_message(msg);
+        g_free(msg);
+        bootrom_path = "";
+    }
+
+    const char *eeprom_path;
+    xemu_settings_get_string(XEMU_SETTINGS_SYSTEM_EEPROM_PATH, &eeprom_path);
+    if (strlen(eeprom_path) > 0 && xemu_check_file(eeprom_path)) {
+        char *msg = g_strdup_printf("Failed to open EEPROM file '%s'. Please check machine settings.", eeprom_path);
+        xemu_queue_error_message(msg);
+        g_free(msg);
+        eeprom_path = "";
+    }
+
+    int short_animation;
+    xemu_settings_get_bool(XEMU_SETTINGS_SYSTEM_SHORTANIM, &short_animation);
+
+    fake_argv[fake_argc++] = g_strdup_printf("xbox%s%s%s%s",
+        strlen(bootrom_path) > 0 ? g_strdup_printf(",bootrom=%s", bootrom_path) : "", // Leak
+        strlen(eeprom_path) > 0 ? g_strdup_printf(",eeprom=%s", eeprom_path) : "", // Leak
+        short_animation ? ",short-animation" : "",
+        ",kernel-irqchip=off"
+        );
+
+    const char *flash_path;
+    xemu_settings_get_string(XEMU_SETTINGS_SYSTEM_FLASH_PATH, &flash_path);
+    autostart = 0; // Do not auto-start the machine without a valid BIOS file
+    if (strlen(flash_path) > 0) {
+        if (xemu_check_file(flash_path)) {
+            char *msg = g_strdup_printf("Failed to open flash file '%s'. Please check machine settings.", flash_path);
+            xemu_queue_error_message(msg);
+            g_free(msg);
+        } else {
+            fake_argv[fake_argc++] = strdup("-bios");
+            fake_argv[fake_argc++] = strdup(flash_path);
+            autostart = 1;
+        }
+    }
+
+    int mem;
+    xemu_settings_get_int(XEMU_SETTINGS_SYSTEM_MEMORY, &mem);
+    fake_argv[fake_argc++] = strdup("-m");
+    fake_argv[fake_argc++] = g_strdup_printf("%d", mem);
+
+    const char *hdd_path;
+    xemu_settings_get_string(XEMU_SETTINGS_SYSTEM_HDD_PATH, &hdd_path);
+    if (strlen(hdd_path) > 0) {
+        if (xemu_check_file(hdd_path)) {
+            char *msg = g_strdup_printf("Failed to open hard disk image file '%s'. Please check machine settings.", hdd_path);
+            xemu_queue_error_message(msg);
+            g_free(msg);
+        } else {
+            fake_argv[fake_argc++] = strdup("-drive");
+            fake_argv[fake_argc++] = g_strdup_printf("index=0,media=disk,file=%s%s",
+                hdd_path,
+                strlen(hdd_path) > 0 ? ",locked" : "");
+        }
+    }
+
+    const char *dvd_path;
+    xemu_settings_get_string(XEMU_SETTINGS_SYSTEM_DVD_PATH, &dvd_path);
+    if (strlen(dvd_path) > 0) {
+        if (xemu_check_file(dvd_path)) {
+            char *msg = g_strdup_printf("Failed to open DVD image file '%s'. Please check machine settings.", dvd_path);
+            xemu_queue_error_message(msg);
+            g_free(msg);
+        } else {
+            fake_argv[fake_argc++] = strdup("-drive");
+            fake_argv[fake_argc++] = g_strdup_printf("index=1,media=cdrom,file=%s",
+                dvd_path);
+        }
+    }
+
+    fake_argv[fake_argc++] = strdup("-display");
+    fake_argv[fake_argc++] = strdup("xemu");
+
+    printf("Created QEMU launch parameters: ");
+    for (int i = 0; i < fake_argc; i++) {
+        printf("%s ", fake_argv[i]);
+    }
+    printf("\n");
+
+    argc = fake_argc;
+    argv = fake_argv;
+
+    /**************************************************************************/
 
     qemu_init_cpu_list();
     qemu_init_cpu_loop();
@@ -2931,7 +3052,9 @@ int main(int argc, char **argv, char **envp)
 
     bdrv_init_with_whitelist();
 
+#ifndef XBOX
     autostart = 1;
+#endif
 
     /* first pass of option parsing */
     optind = 1;

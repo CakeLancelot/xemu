@@ -194,6 +194,31 @@ static DisplayState *get_alloc_displaystate(void);
 static void text_console_update_cursor_timer(void);
 static void text_console_update_cursor(void *opaque);
 
+#ifdef XBOX
+#if 1
+#define DPRINTF(...)
+#else
+#define DPRINTF(...) fprintf(stderr, __VA_ARGS__)
+#endif
+
+// FIXME: Cleanup
+static int64_t swap_start = 0;
+static int64_t swap_end = 0;
+static int64_t swap_time = 0;
+void pre_swap(void)
+{
+    swap_start = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+}
+
+void post_swap(void)
+{
+    swap_end = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    swap_time = swap_end-swap_start;
+}
+
+float fps = 1.0;
+#endif
+
 static void gui_update(void *opaque)
 {
     uint64_t interval = GUI_REFRESH_INTERVAL_IDLE;
@@ -203,7 +228,19 @@ static void gui_update(void *opaque)
     QemuConsole *con;
 
     ds->refreshing = true;
+
+#ifdef XBOX
+    static int64_t targeted_update_start = 0;
+    int64_t update_start = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+#endif
+
     dpy_refresh(ds);
+
+#ifdef XBOX
+    static int64_t last_update_complete = 0;
+    int64_t update_complete = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+#endif
+
     ds->refreshing = false;
 
     QLIST_FOREACH(dcl, &ds->listeners, next) {
@@ -222,7 +259,86 @@ static void gui_update(void *opaque)
         }
         trace_console_refresh(interval);
     }
+
+#ifdef XBOX
+    interval = 16666666; // 60Hz
+
+    // Check how well we are targeting the 60Hz target refresh rate
+    const float r = 1.0/60.0;
+    float new;
+    if (last_update_complete != 0) {
+        new = (float)(update_complete-last_update_complete)/1000000.0;
+        static float avg_time_between_frames = 0.0;
+        avg_time_between_frames = (avg_time_between_frames*(1.0-r))+new*r;
+        if (fabs(new-avg_time_between_frames) > avg_time_between_frames*0.5) avg_time_between_frames = new;
+        fps = 1000.0f/(avg_time_between_frames);
+        DPRINTF("Time between frames: %6.3f ms (ideal 16.67ms) %f FPS\n", avg_time_between_frames, fps);
+    }
+    last_update_complete = update_complete;
+
+    // Check time taken to update
+    //
+    // If you have enabled "Sync to VBlank" in your driver and try to drive the
+    // update timer faster than your vblank frequency, the driver will block to
+    // sync back up to vblank and CPUs will be starved for time. You'll see this
+    // reflected in "Time between frames" below. If you disable "Sync to VBlank"
+    // however, you can drive this timer as fast as you want.
+    static float avg_update_time = 0.0;
+    new = (float)(update_complete-update_start)/1000000.0;
+    avg_update_time = (avg_update_time*(1.0-r))+new*r;
+    if (fabs(new-avg_update_time) > avg_update_time*0.5) avg_update_time = new;
+    DPRINTF("Time to update:      %6.3f ms (ideal 0ms)\n",    avg_update_time);
+    DPRINTF("   - Swap Time:      %6.3f ms\n", (float)swap_time/1000000.0);
+    DPRINTF(" - Render Time:      %6.3f ms\n", (float)(update_complete-update_start-swap_time)/1000000.0);
+
+    // Check timers for accuracy
+    //
+    // If the VM is paused there will be fewer timers keeping the process awake,
+    // so the GUI timer appear to get a little extra sleepy (incurring extra
+    // latency). This translates to a slight miss of the refresh deadline,
+    // yielding occasionally 59FPS instead of 60FPS. One solution to this is to
+    // have a dummy timer that runs in the background just to keep things hot.
+    // However, lets just accept it to keep utilization down when paused.
+    if (targeted_update_start != 0) {
+        int64_t delta = update_start-targeted_update_start;
+        DPRINTF("Timer delta:         %6.3f ms (ideal 0ms)\n", (float)delta/1000000.0);
+    }
+
+    if (swap_time >= interval) {
+        DPRINTF("Missed swap\n");
+    } else {
+        // Try to dial back to get closer to vblank
+        int64_t render_time = update_complete-update_start;
+        if (render_time > 0) {
+            interval -= render_time;
+        }
+
+        // Try to compensate for timer delta
+        if (targeted_update_start > 0) {
+            int64_t delta = update_start-targeted_update_start;
+            if (delta > 0) {
+                interval -= delta;
+            }
+        }
+
+        if (swap_time > 1000000) {
+            // Swap took over 1ms! We may be moving too fast and the driver
+            // could be stalling when trying to swap frames in order to line up
+            // with vblank.
+            //
+            // Advance the timer interval a bit to try to line up and minimize
+            // the amount of wait time before vblank, as we want to do actual
+            // work with those cycles.
+            DPRINTF("Slowing...\n");
+            interval += swap_time/2;
+        }    
+    }
+
+    ds->last_update = update_complete;
+    targeted_update_start = ds->last_update + interval;
+#else
     ds->last_update = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+#endif
     timer_mod(ds->gui_timer, ds->last_update + interval);
 }
 
@@ -246,8 +362,13 @@ static void gui_setup_refresh(DisplayState *ds)
     }
 
     if (need_timer && ds->gui_timer == NULL) {
+#ifdef XBOX
+        ds->gui_timer = timer_new_ns(QEMU_CLOCK_REALTIME, gui_update, ds);
+        timer_mod(ds->gui_timer, qemu_clock_get_ns(QEMU_CLOCK_REALTIME));
+#else
         ds->gui_timer = timer_new_ms(QEMU_CLOCK_REALTIME, gui_update, ds);
         timer_mod(ds->gui_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME));
+#endif
     }
     if (!need_timer && ds->gui_timer != NULL) {
         timer_del(ds->gui_timer);
